@@ -371,7 +371,7 @@ impl Insn {
 
     /// Return true if the instruction needs to be kept around. For example, if the instruction
     /// might have a side effect, or if the instruction may raise an exception.
-    fn has_effects(&self) -> bool {
+    fn has_effects(&self, func: &Function) -> bool {
         match self {
             Insn::PutSelf => false,
             Insn::Const { .. } => false,
@@ -384,9 +384,23 @@ impl Insn {
             Insn::FixnumAdd  { .. } => false,
             Insn::FixnumSub  { .. } => false,
             Insn::FixnumMult { .. } => false,
-            // TODO(max): Consider adding a Guard that the rhs is non-zero before Div and Mod
-            // Div *is* critical unless we can prove the right hand side != 0
-            // Mod *is* critical unless we can prove the right hand side != 0
+            Insn::FixnumDiv {left: _, right, state: _}
+            | Insn::FixnumMod {left: _, right, state: _} => {
+                // If the right side is const evaled to not be zero on a division
+                // or mod, then we don't need a guard. Otherwise, we do.
+                // TODO(max): Consider adding a Guard that the rhs is non-zero before Div and Mod
+                match func.find(*right) {
+                    Insn::Const {val} => {
+                        match val {
+                            hir::Const::Value(f) => {
+                                f == VALUE(0)
+                            }
+                            _ => true
+                        }
+                    }
+                    _ => true
+                }
+            }
             Insn::FixnumEq   { .. } => false,
             Insn::FixnumNeq  { .. } => false,
             Insn::FixnumLt   { .. } => false,
@@ -1240,7 +1254,7 @@ impl Function {
         for block_id in &rpo {
             for insn_id in &self.blocks[block_id.0].insns {
                 let insn = &self.insns[insn_id.0];
-                if insn.has_effects() {
+                if insn.has_effects(&self) {
                     worklist.push_back(*insn_id);
                 }
             }
@@ -3563,6 +3577,70 @@ mod opt_tests {
               PatchPoint MethodRedefined(String@0x1008, bytesize@0x1010)
               v7:Fixnum = CCall bytesize@0x1018, v2
               Return v7
+        "#]]);
+    }
+
+    #[test]
+    fn test_eliminate_dead_divide() {
+        eval("
+            def test(x)
+                x / 3
+                5
+            end
+            test(1)
+        ");
+        assert_optimized_method_hir("test", expect![[r#"
+            fn test:
+            bb0(v0:BasicObject):
+              v2:Fixnum[3] = Const Value(3)
+              PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_DIV)
+              v8:Fixnum = GuardType v0, Fixnum
+              v5:Fixnum[5] = Const Value(5)
+              Return v5
+        "#]]);
+    }
+
+    #[test]
+    fn test_no_eliminate_unkown_divide() {
+        eval("
+            def test(x, y)
+                x / y
+                5
+            end
+            test(1, 2)
+        ");
+        assert_optimized_method_hir("test", expect![[r#"
+            fn test:
+            bb0(v0:BasicObject, v1:BasicObject):
+              PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_DIV)
+              v8:Fixnum = GuardType v0, Fixnum
+              v9:Fixnum = GuardType v1, Fixnum
+              v10:Fixnum = FixnumDiv v8, v9
+              v5:Fixnum[5] = Const Value(5)
+              Return v5
+        "#]]);
+    }
+
+    #[test]
+    fn test_no_eliminate_bad_divide() {
+        eval("
+            def test(x)
+                begin
+                    x / 0
+                rescue ZeroDivisionError
+                end
+                5
+            end
+            test(1)
+        ");
+        assert_optimized_method_hir("test", expect![[r#"
+            fn test:
+            bb0(v0:BasicObject):
+              v2:Fixnum[0] = Const Value(0)
+              PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_DIV)
+              v8:Fixnum = GuardType v0, Fixnum
+              v5:Fixnum[5] = Const Value(5)
+              Return v5
         "#]]);
     }
 }
